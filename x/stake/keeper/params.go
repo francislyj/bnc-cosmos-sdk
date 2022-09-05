@@ -15,7 +15,8 @@ const (
 )
 
 var (
-	DelegationAccAddr = sdk.AccAddress(crypto.AddressHash([]byte("BinanceChainStakeDelegation")))
+	DelegationAccAddr          = sdk.AccAddress(crypto.AddressHash([]byte("BinanceChainStakeDelegation")))
+	BeaconChainSlashRewardAddr = sdk.AccAddress(crypto.AddressHash([]byte("BeaconChainSlashRewardAddr")))
 )
 
 // ParamTable for stake module

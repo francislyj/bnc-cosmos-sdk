@@ -2,6 +2,7 @@ package slashing
 
 import (
 	"fmt"
+	"github.com/cosmos/cosmos-sdk/x/stake/keeper"
 	"math"
 	"time"
 
@@ -69,6 +70,105 @@ func (k *Keeper) SetPbsbServer(server *pubsub.Server) {
 
 // handle a validator signing two blocks at the same height
 // power: power of the double-signing validator at the height of infraction
+func (k Keeper) handleBeaconChainDoubleSign(ctx sdk.Context, addr crypto.Address, infractionHeight int64, timestamp time.Time, power int64) {
+	logger := ctx.Logger().With("module", "x/slashing")
+	time := ctx.BlockHeader().Time
+	age := time.Sub(timestamp)
+	consAddr := sdk.ConsAddress(addr)
+	pubkey, err := k.getPubkey(ctx, addr)
+	if err != nil {
+		panic(fmt.Sprintf("Validator consensus-address %v not found", consAddr))
+	}
+
+	// Infraction height has slashed
+	if k.hasSlashRecord(ctx, consAddr.Bytes(), DoubleSign, uint64(infractionHeight)) {
+		return
+	}
+
+	// Double sign too old
+	maxEvidenceAge := k.MaxEvidenceAge(ctx)
+	if age > maxEvidenceAge {
+		logger.Info(fmt.Sprintf("Ignored double sign from %s at height %d, age of %d past max age of %d", pubkey.Address(), infractionHeight, age, maxEvidenceAge))
+		return
+	}
+
+	// Double sign confirmed
+	logger.Info(fmt.Sprintf("Confirmed double sign from %s at height %d, age of %d less than max age of %d", pubkey.Address(), infractionHeight, age, maxEvidenceAge))
+
+	// Slash beacon chain
+	validator, slashedAmount, validatorsCompensation, toFeePool, slashErr := k.slashBeaconChain(ctx, consAddr, true)
+	if slashErr != nil {
+		return
+	}
+
+	jailUntil := ctx.BlockHeader().Time.Add(k.DoubleSignUnbondDuration(ctx))
+	// Set or updated validator jail duration
+	signInfo, found := k.getValidatorSigningInfo(ctx, consAddr.Bytes())
+	if !found {
+		panic(fmt.Sprintf("Expected signing info for validator %s but not found", consAddr.String()))
+	}
+	signInfo.JailedUntil = jailUntil
+	k.setValidatorSigningInfo(ctx, consAddr.Bytes(), signInfo)
+
+	// Set slash record
+	sr := SlashRecord{
+		ConsAddr:         consAddr.Bytes(),
+		InfractionType:   DoubleSign,
+		InfractionHeight: uint64(infractionHeight),
+		SlashHeight:      ctx.BlockHeight(),
+		JailUntil:        jailUntil,
+		SlashAmt:         slashedAmount.RawInt(),
+	}
+	k.setSlashRecord(ctx, sr)
+
+	// Pub slash event
+	if ctx.IsDeliverTx() && k.PbsbServer != nil {
+		event := SlashEvent{
+			Validator:              validator.GetOperator(),
+			InfractionType:         DoubleSign,
+			InfractionHeight:       infractionHeight,
+			SlashHeight:            ctx.BlockHeight(),
+			JailUtil:               jailUntil,
+			SlashAmt:               slashedAmount.RawInt(),
+			ToFeePool:              toFeePool,
+			ValidatorsCompensation: validatorsCompensation,
+		}
+		k.PbsbServer.Publish(event)
+	}
+}
+
+// slashBeaconChain slash beacon chain
+func (k Keeper) slashBeaconChain(ctx sdk.Context, consAddr sdk.ConsAddress, isDoubleSign bool) (sdk.Validator, sdk.Dec, map[string]int64, int64, error) {
+	logger := ctx.Logger().With("module", "x/slashing")
+	slashAmount := k.DowntimeSlashAmount(ctx)
+	if isDoubleSign {
+		slashAmount = k.DoubleSignSlashAmount(ctx)
+	}
+	validator, slashedAmount, slashErr := k.validatorSet.SlashBeaconChain(ctx, consAddr.Bytes(), sdk.NewDec(slashAmount))
+	if slashErr != nil {
+		return validator, slashedAmount, nil, 0, slashErr
+	}
+
+	var toFeePool int64
+	var validatorsCompensation map[string]int64
+
+	bondDenom := k.validatorSet.BondDenom(ctx)
+	remainingReward := slashedAmount.RawInt()
+	if remainingReward > 0 {
+		logger.Info(fmt.Sprintf("begin allocate amt to beacon validators =====> address %v  remainreward %v", sdk.HexAddress(consAddr.Bytes()), sdk.NewDec(remainingReward)))
+		if ctx.IsDeliverTx() { // if the related validators are not found, the amount will be added to fee pool
+			toFeePool = remainingReward
+			if _, _, err := k.BankKeeper.AddCoins(ctx, keeper.BeaconChainSlashRewardAddr, sdk.Coins{sdk.NewCoin(bondDenom, remainingReward)}); err != nil {
+				panic(err)
+			}
+		}
+	}
+
+	return validator, slashedAmount, validatorsCompensation, toFeePool, nil
+}
+
+// handle a validator signing two blocks at the same height
+// power: power of the double-signing validator at the height of infraction
 func (k Keeper) handleDoubleSign(ctx sdk.Context, addr crypto.Address, infractionHeight int64, timestamp time.Time, power int64) {
 	logger := ctx.Logger().With("module", "x/slashing")
 	time := ctx.BlockHeader().Time
@@ -127,7 +227,7 @@ func (k Keeper) handleDoubleSign(ctx sdk.Context, addr crypto.Address, infractio
 
 // handle a validator signature, must be called once per validator per block
 // TODO refactor to take in a consensus address, additionally should maybe just take in the pubkey too
-func (k Keeper) handleValidatorSignature(ctx sdk.Context, addr crypto.Address, power int64, signed bool) {
+func (k Keeper) handleBeaconChainValidatorSignature(ctx sdk.Context, addr crypto.Address, power int64, signed bool) {
 	logger := ctx.Logger().With("module", "x/slashing")
 	height := ctx.BlockHeight()
 	consAddr := sdk.ConsAddress(addr)
@@ -167,20 +267,18 @@ func (k Keeper) handleValidatorSignature(ctx sdk.Context, addr crypto.Address, p
 	}
 	minHeight := signInfo.StartHeight + k.SignedBlocksWindow(ctx)
 	maxMissed := k.SignedBlocksWindow(ctx) - k.MinSignedPerWindow(ctx)
-	if height > minHeight && signInfo.MissedBlocksCounter > maxMissed {
+	//logger.Info(fmt.Sprintf("handleBeaconChainValidatorSignature height %v, minHeight %v, signInfo.MissedBlocksCounter %v, maxMissed %v", height, minHeight, signInfo.MissedBlocksCounter, maxMissed))
+	if height > minHeight && signInfo.MissedBlocksCounter >= maxMissed {
 		validator := k.validatorSet.ValidatorByConsAddr(ctx, consAddr)
 		if validator != nil && !validator.GetJailed() {
 			// Downtime confirmed: slash and jail the validator
 			logger.Info(fmt.Sprintf("Validator %s past min height of %d and below signed blocks threshold of %d",
 				pubkey.Address(), minHeight, k.MinSignedPerWindow(ctx)))
-			// We need to retrieve the stake distribution which signed the block, so we subtract ValidatorUpdateDelay from the evidence height,
-			// and subtract an additional 1 since this is the LastCommit.
-			// Note that this *can* result in a negative "distributionHeight" up to -ValidatorUpdateDelay-1,
-			// i.e. at the end of the pre-genesis block (none) = at the beginning of the genesis block.
-			// That's fine since this is just used to filter unbonding delegations & redelegations.
-			distributionHeight := height - stake.ValidatorUpdateDelay - 1
-			k.validatorSet.Slash(ctx, consAddr, distributionHeight, power, k.SlashFractionDowntime(ctx))
-			k.validatorSet.Jail(ctx, consAddr)
+
+			_, _, _, _, slashErr := k.slashBeaconChain(ctx, consAddr, false)
+			if slashErr != nil {
+				return
+			}
 			signInfo.JailedUntil = ctx.BlockHeader().Time.Add(k.DowntimeUnbondDuration(ctx))
 			// We need to reset the counter & array so that the validator won't be immediately slashed for downtime upon rebonding.
 			signInfo.MissedBlocksCounter = 0

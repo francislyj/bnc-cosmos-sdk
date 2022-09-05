@@ -1,11 +1,74 @@
 package keeper
 
 import (
+	"errors"
 	"fmt"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/x/stake/types"
 )
+
+func (k Keeper) SlashBeaconChain(ctx sdk.Context, consAddr []byte, slashAmount sdk.Dec) (sdk.Validator, sdk.Dec, error) {
+	logger := ctx.Logger().With("module", "x/stake")
+	validator, found := k.GetValidatorByConsAddr(ctx, consAddr)
+	if !found {
+		// If not found, the validator must have been overslashed and removed - so we don't need to do anything
+		// NOTE:  Correctness dependent on invariant that unbonding delegations / redelegations must also have been completely
+		//        slashed in this case - which we don't explicitly check, but should be true.
+		// Log the slash attempt for future reference (maybe we should tag it too)
+		logger.Error(fmt.Sprintf(
+			"WARNING: Ignored attempt to slash a nonexistent validator with address %s, we recommend you investigate immediately",
+			sdk.HexEncode(consAddr)))
+		return nil, sdk.ZeroDec(), nil
+	}
+
+	// should not be slashing unbonded
+	if validator.IsUnbonded() {
+		return nil, sdk.ZeroDec(), errors.New(fmt.Sprintf("should not be slashing unbonded validator: %s", validator.GetOperator()))
+	}
+
+	if !validator.Jailed {
+		k.Jail(ctx, consAddr)
+	}
+
+	selfDelegation, found := k.GetDelegation(ctx, validator.FeeAddr, validator.OperatorAddr)
+	remainingSlashAmount := slashAmount
+	if found {
+		slashShares := validator.SharesFromTokens(slashAmount)
+		slashSelfDelegationShares := sdk.MinDec(slashShares, selfDelegation.Shares)
+		if slashSelfDelegationShares.RawInt() > 0 {
+			unbondAmount, err := k.unbond(ctx, selfDelegation.DelegatorAddr, validator.OperatorAddr, slashSelfDelegationShares)
+			if err != nil {
+				return nil, sdk.ZeroDec(), errors.New(fmt.Sprintf("error unbonding delegator: %v", err))
+			}
+			remainingSlashAmount = remainingSlashAmount.Sub(unbondAmount)
+		}
+	}
+
+	if remainingSlashAmount.RawInt() > 0 {
+		ubd, found := k.GetUnbondingDelegation(ctx, validator.FeeAddr, validator.OperatorAddr)
+		if found {
+			slashUnBondingAmount := sdk.MinInt64(remainingSlashAmount.RawInt(), ubd.Balance.Amount)
+			ubd.Balance.Amount = ubd.Balance.Amount - slashUnBondingAmount
+			k.SetUnbondingDelegation(ctx, ubd)
+			remainingSlashAmount = remainingSlashAmount.Sub(sdk.NewDec(slashUnBondingAmount))
+		}
+	}
+
+	slashedAmt := slashAmount.Sub(remainingSlashAmount)
+
+	bondDenom := k.BondDenom(ctx)
+	delegationAccBalance := k.bankKeeper.GetCoins(ctx, DelegationAccAddr)
+	slashedCoin := sdk.NewCoin(bondDenom, slashedAmt.RawInt())
+	if err := k.bankKeeper.SetCoins(ctx, DelegationAccAddr, delegationAccBalance.Minus(sdk.Coins{slashedCoin})); err != nil {
+		return nil, slashedAmt, err
+	}
+	if ctx.IsDeliverTx() && k.addrPool != nil {
+		k.addrPool.AddAddrs([]sdk.AccAddress{DelegationAccAddr})
+	}
+
+	return validator, slashedAmt, nil
+}
 
 // Slash a validator for an infraction committed at a known height
 // Find the contributing stake at that height and burn the specified slashFactor

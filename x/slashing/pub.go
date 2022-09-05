@@ -26,3 +26,18 @@ type SideSlashEvent struct {
 func (event SideSlashEvent) GetTopic() pubsub.Topic {
 	return Topic
 }
+
+type SlashEvent struct {
+	Validator              sdk.ValAddress
+	InfractionType         byte
+	InfractionHeight       int64
+	SlashHeight            int64
+	JailUtil               time.Time
+	SlashAmt               int64
+	ToFeePool              int64
+	ValidatorsCompensation map[string]int64
+}
+
+func (event SlashEvent) GetTopic() pubsub.Topic {
+	return Topic
+}
